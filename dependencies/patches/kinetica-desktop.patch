@@ -1,0 +1,406 @@
+--- a/kinetica-appkit/src@macosArm64/AppKitKineticaApp.kt
++++ b/kinetica-appkit/src@macosArm64/AppKitKineticaApp.kt
+@@ -1,5 +1,6 @@
+ package io.heapy.kinetica.appkit
+ 
++import io.heapy.kinetica.canvas.*
+ import io.heapy.kinetica.ComponentScope
+ import io.heapy.kinetica.HostNode
+ import io.heapy.kinetica.KineticaRuntime
+@@ -23,7 +24,8 @@
+ import platform.AppKit.NSAccessibilityPopUpButtonRole
+ import platform.AppKit.NSColor
+ import platform.AppKit.NSFont
+-import platform.AppKit.NSLayoutAttributeWidth
++import platform.AppKit.NSLayoutAttributeLeading
++import platform.AppKit.NSLayoutAttributeTop
+ import platform.AppKit.NSLayoutConstraint
+ import platform.AppKit.NSButton
+ import platform.AppKit.NSControl
+@@ -223,6 +225,8 @@
+     private val outlineEvents = mutableMapOf<AppKitOutlineTable, String>()
+     private val outlineModels = mutableMapOf<AppKitOutlineTable, String>()
+     private val choiceEvents = mutableMapOf<AppKitChoice, String>()
++    private val canvasEvents = mutableMapOf<AppKitCanvas, String>()
++    private val canvasModels = mutableMapOf<AppKitCanvas, String>()
+     private val sizeConstraints = mutableMapOf<Pair<NSView, String>, NSLayoutConstraint>()
+ 
+     override fun canReuseHost(previous: HostNode, next: HostNode): Boolean =
+@@ -248,7 +252,7 @@
+                 )
+                 setSpacing(8.0)
+                 setDetachesHiddenViews(false)
+-                if (node.tag == "column") setAlignment(NSLayoutAttributeWidth)
++                setAlignment(if (node.tag == "column") NSLayoutAttributeLeading else NSLayoutAttributeTop)
+             }
+             "button" -> makeButton(node)
+             "checkbox" -> makeCheckbox(node)
+@@ -264,6 +268,12 @@
+                 }
+                 bindOutline(table, node)
+                 table
++            }
++            CANVAS_TAG -> {
++                lateinit var canvas: AppKitCanvas
++                canvas = AppKitCanvas { input -> canvasEvents[canvas]?.let { dispatcher.dispatch(it, input) } }
++                bindCanvas(canvas, node)
++                canvas
+             }
+             CHOICE_TAG -> {
+                 lateinit var choice: AppKitChoice
+@@ -379,6 +389,7 @@
+         }
+         if (view is AppKitOutlineTable) bindOutline(view, node)
+         if (view is AppKitChoice) bindChoice(view, node)
++        if (view is AppKitCanvas) bindCanvas(view, node)
+         if (node.tag == "button") {
+             (view as? NSButton)?.setTitle(foldedCaption(node))
+         }
+@@ -414,6 +425,17 @@
+             view.dispose()
+         }
+         if (view is AppKitChoice) { choiceEvents.remove(view); view.dispose() }
++        if (view is AppKitCanvas) { canvasEvents.remove(view); canvasModels.remove(view); view.dispose() }
++    }
++
++    private fun bindCanvas(view: AppKitCanvas, node: HostNode) {
++        require(node.children.isEmpty()) { "Canvas must be a leaf" }
++        val event = node.props["event:onCanvas"]
++        if (event == null) canvasEvents.remove(view) else canvasEvents[view] = event
++        val encoded = node.props.getValue("model")
++        if (canvasModels[view] != encoded) {
++            view.update(Json.decodeFromString<CanvasModel>(encoded)); canvasModels[view] = encoded
++        }
+     }
+ 
+     private fun bindChoice(view: AppKitChoice, node: HostNode) {
+@@ -499,7 +521,7 @@
+ }
+ 
+ /** Tags whose text is represented by widget state rather than a child view. */
+-private val LEAF_WIDGET_TAGS: Set<String> = setOf("button", "checkbox", "textInput", "appkit:label", "appkit:spacer", OUTLINE_TABLE_TAG, CHOICE_TAG)
++private val LEAF_WIDGET_TAGS: Set<String> = setOf("button", "checkbox", "textInput", "appkit:label", "appkit:spacer", OUTLINE_TABLE_TAG, CHOICE_TAG, CANVAS_TAG)
+ 
+ /** Shared action target and text-field delegate; each dispatch drains renders synchronously. */
+ @OptIn(ExperimentalForeignApi::class, BetaInteropApi::class)
+--- /dev/null
++++ b/kinetica-appkit/src@macosArm64/AppKitCanvas.kt
+@@ -0,0 +1,108 @@
++@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class)
++package io.heapy.kinetica.appkit
++
++import io.heapy.kinetica.canvas.*
++import kotlinx.cinterop.*
++import platform.AppKit.*
++import platform.Foundation.*
++
++/** Framework-owned canvas: applications only see CanvasModel and CanvasInput. */
++internal class AppKitCanvas(private var input: ((CanvasInput) -> Unit)?) : NSView(NSMakeRect(0.0, 0.0, 640.0, 640.0)) {
++    private var model: CanvasModel? = null
++    private var lastWidth = 0.0
++    private var lastHeight = 0.0
++
++    init {
++        setContentHuggingPriority(1f, NSUserInterfaceLayoutOrientationHorizontal)
++        setContentHuggingPriority(1f, NSUserInterfaceLayoutOrientationVertical)
++        setContentCompressionResistancePriority(1f, NSUserInterfaceLayoutOrientationHorizontal)
++        setContentCompressionResistancePriority(1f, NSUserInterfaceLayoutOrientationVertical)
++    }
++
++    override fun isFlipped(): Boolean = true
++    override fun acceptsFirstResponder(): Boolean = true
++    override fun acceptsFirstMouse(event: NSEvent?): Boolean = true
++
++    fun update(next: CanvasModel) { if (model != next) { model = next; setNeedsDisplay(true) } }
++    fun dispose() { input = null; model = null }
++
++    override fun setFrameSize(newSize: CValue<NSSize>) {
++        super.setFrameSize(newSize)
++        newSize.useContents {
++            if (width > 0 && height > 0 && (width != lastWidth || height != lastHeight)) {
++                lastWidth = width; lastHeight = height
++                input?.invoke(CanvasInput.Resize(width, height))
++            }
++        }
++    }
++
++    override fun drawRect(dirtyRect: CValue<NSRect>) {
++        val scene = model ?: return
++        NSGraphicsContext.saveGraphicsState()
++        try {
++            NSBezierPath.bezierPathWithRect(bounds).addClip()
++            scene.background.native().setFill()
++            NSRectFill(bounds)
++            val transform = NSAffineTransform.transform()
++            bounds.useContents { transform.scaleXBy(size.width / scene.width, yBy = size.height / scene.height) }
++            transform.concat()
++            for (shape in scene.shapes) when (shape) {
++                is CanvasShape.Polygon -> {
++                    val path = NSBezierPath.bezierPath()
++                    path.moveToPoint(NSMakePoint(shape.points.first().x, shape.points.first().y))
++                    shape.points.drop(1).forEach { path.lineToPoint(NSMakePoint(it.x, it.y)) }
++                    path.closePath(); shape.fill.native().setFill(); path.fill()
++                }
++                is CanvasShape.Line -> {
++                    if (!listOf(shape.x1, shape.y1, shape.x2, shape.y2, shape.width).all(Double::isFinite)) continue
++                    val path = NSBezierPath.bezierPath()
++                    path.moveToPoint(NSMakePoint(shape.x1, shape.y1)); path.lineToPoint(NSMakePoint(shape.x2, shape.y2))
++                    path.setLineWidth(shape.width.coerceAtLeast(0.1)); shape.color.native().setStroke(); path.stroke()
++                }
++                is CanvasShape.Rectangle -> {
++                    if (!listOf(shape.x, shape.y, shape.width, shape.height).all(Double::isFinite) || shape.width < 0 || shape.height < 0) continue
++                    shape.fill.native().setFill(); NSRectFill(NSMakeRect(shape.x, shape.y, shape.width, shape.height))
++                }
++                is CanvasShape.Circle -> {
++                    if (!listOf(shape.x, shape.y, shape.radius, shape.strokeWidth).all(Double::isFinite) || shape.radius < 0) continue
++                    val path = NSBezierPath.bezierPathWithOvalInRect(NSMakeRect(shape.x - shape.radius, shape.y - shape.radius, shape.radius * 2, shape.radius * 2))
++                    shape.fill?.let { it.native().setFill(); path.fill() }
++                    shape.stroke?.let { it.native().setStroke(); path.setLineWidth(shape.strokeWidth.coerceAtLeast(0.1)); path.stroke() }
++                }
++            }
++        } finally { NSGraphicsContext.restoreGraphicsState() }
++    }
++
++    private fun point(event: NSEvent): Pair<Double, Double> {
++        val scene = model
++        return convertPoint(event.locationInWindow, fromView = null).useContents {
++            val bw = bounds.useContents { size.width }; val bh = bounds.useContents { size.height }
++            x * (scene?.width ?: bw) / bw.coerceAtLeast(1.0) to y * (scene?.height ?: bh) / bh.coerceAtLeast(1.0)
++        }
++    }
++    private fun pointer(event: NSEvent, phase: PointerPhase) {
++        val (x, y) = point(event); input?.invoke(CanvasInput.Pointer(phase, x, y))
++    }
++    override fun mouseDown(event: NSEvent) { window?.makeFirstResponder(this); pointer(event, PointerPhase.DOWN) }
++    override fun mouseDragged(event: NSEvent) { pointer(event, PointerPhase.MOVE) }
++    override fun mouseUp(event: NSEvent) { pointer(event, PointerPhase.UP) }
++    override fun scrollWheel(event: NSEvent) {
++        val (x, y) = point(event)
++        input?.invoke(CanvasInput.Scroll(x, y, -event.scrollingDeltaY * if (event.hasPreciseScrollingDeltas) 1 else 12))
++    }
++    override fun magnifyWithEvent(event: NSEvent) {
++        val (x, y) = point(event); input?.invoke(CanvasInput.Zoom(x, y, (1 + event.magnification).coerceAtLeast(0.1)))
++    }
++    override fun keyDown(event: NSEvent) {
++        val key = when (event.keyCode.toInt()) {
++            123 -> "ArrowLeft"; 124 -> "ArrowRight"; 125 -> "ArrowDown"; 126 -> "ArrowUp"
++            36, 76 -> "Enter"; 49 -> " "; 115 -> "Home"; 53 -> "Escape"
++            else -> event.charactersIgnoringModifiers.orEmpty()
++        }
++        if (key in setOf("ArrowLeft", "ArrowRight", "ArrowDown", "ArrowUp", "Enter", " ", "Home", "Escape", "+", "=", "-"))
++            input?.invoke(CanvasInput.Key(key, event.modifierFlags and NSEventModifierFlagShift != 0uL))
++        else super.keyDown(event)
++    }
++}
++
++private fun CanvasColor.native(): NSColor = NSColor.colorWithCalibratedRed(red, green, blue, alpha)
+--- /dev/null
++++ b/kinetica-appkit/src@macosArm64/DesktopApplication.kt
+@@ -0,0 +1,45 @@
++@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class)
++package io.heapy.kinetica.desktop
++
++import io.heapy.kinetica.*
++import io.heapy.kinetica.application.*
++import io.heapy.kinetica.appkit.*
++import platform.AppKit.NSPasteboard
++import platform.AppKit.NSPasteboardTypeString
++
++/** Single-window desktop entry point. Native delegates, menus and editing stay in Kinetica. */
++public fun runDesktopApplication(
++    name: String,
++    window: ApplicationWindow = ApplicationWindow("main", name),
++    release: (() -> Unit) -> Unit = { it() },
++    content: @UiComponent ComponentScope.() -> Unit,
++) {
++    val app = AppKitApplication(name)
++    app.commands.register(ApplicationCommand("app.quit", "Quit $name", listOf(KeyShortcut("q"))) { app.requestQuit() })
++    app.commands.register(ApplicationCommand("app.hide", "Hide $name", listOf(KeyShortcut("h"))) { app.hide() })
++    app.commands.register(ApplicationCommand("window.close", "Close Window", listOf(KeyShortcut("w")), windowRequired = true) { app.activeWindow?.close() })
++    app.editingCommand("edit.cut", "Cut", KeyShortcut("x"), EditingCommand.CUT)
++    app.editingCommand("edit.copy", "Copy", KeyShortcut("c"), EditingCommand.COPY)
++    app.editingCommand("edit.paste", "Paste", KeyShortcut("v"), EditingCommand.PASTE)
++    app.editingCommand("edit.selectAll", "Select All", KeyShortcut("a"), EditingCommand.SELECT_ALL)
++    app.editingCommand("edit.undo", "Undo", KeyShortcut("z"), EditingCommand.UNDO)
++    app.setMenus(listOf(ApplicationMenu(name, listOf(MenuItem.Command("app.hide"), MenuItem.Command("app.quit"))),
++        ApplicationMenu("Edit", listOf("edit.undo", "edit.cut", "edit.copy", "edit.paste", "edit.selectAll").map { MenuItem.Command(it) }),
++        ApplicationMenu("Window", listOf(MenuItem.Command("window.close")))))
++    try {
++        app.install()
++        app.openWindow(window, callbacks = WindowCallbacks(release = release), content = content)
++        app.run()
++    } finally { app.dispose() }
++}
++
++public fun copyTextToClipboard(text: String) {
++    val clipboard = NSPasteboard.generalPasteboard
++    clipboard.clearContents()
++    clipboard.setString(text, forType = NSPasteboardTypeString)
++}
++
++@UiComponent
++public fun ComponentScope.label(value: String, fontSize: Double = 13.0, secondary: Boolean = false, semantics: Semantics? = null) {
++    host("appkit:label", props = mapOf("value" to value, "fontSize" to fontSize.toString(), "secondary" to secondary.toString()), semantics = semantics)
++}
+--- /dev/null
++++ b/kinetica-appkit/src@macosArm64/DesktopPreview.kt
+@@ -0,0 +1,42 @@
++@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class)
++package io.heapy.kinetica.desktop.testing
++
++import io.heapy.kinetica.*
++import io.heapy.kinetica.application.WindowSize
++import io.heapy.kinetica.appkit.renderAppKitApp
++import kotlinx.cinterop.*
++import platform.AppKit.*
++import platform.Foundation.*
++
++/** Render an owned offscreen view to PNG. Does not inspect or control other applications.
++ * Call on the native UI thread. Useful for application previews and rendering tests. */
++public fun desktopPreviewPng(size: WindowSize, content: @UiComponent ComponentScope.() -> Unit): ByteArray {
++    NSApplication.sharedApplication()
++    val window = NSWindow(NSMakeRect(0.0,0.0,size.width,size.height), NSWindowStyleMaskTitled, NSBackingStoreBuffered, false)
++    window.setReleasedWhenClosed(false)
++    window.appearance = NSAppearance.appearanceNamed(NSAppearanceNameAqua)
++    val view = PreviewBackground(NSMakeRect(0.0,0.0,size.width,size.height))
++    window.contentView = view
++    val renderer = renderAppKitApp(view, content = content)
++    try {
++        repeat(3) {
++            view.layoutSubtreeIfNeeded()
++            NSRunLoop.currentRunLoop.runUntilDate(NSDate.dateWithTimeIntervalSinceNow(0.02))
++            renderer.renderUntilSettled()
++        }
++        view.layoutSubtreeIfNeeded()
++        val bitmap = requireNotNull(view.bitmapImageRepForCachingDisplayInRect(view.bounds))
++        view.effectiveAppearance.performAsCurrentDrawingAppearance {
++            view.cacheDisplayInRect(view.bounds, toBitmapImageRep = bitmap)
++        }
++        val data = requireNotNull(bitmap.representationUsingType(NSBitmapImageFileType.NSBitmapImageFileTypePNG, properties = emptyMap<Any?, Any>()))
++        return requireNotNull(data.bytes).reinterpret<ByteVar>().readBytes(data.length.toInt())
++    } finally { renderer.dispose(); window.close() }
++}
++
++private class PreviewBackground(frame: CValue<NSRect>) : NSView(frame) {
++    override fun drawRect(dirtyRect: CValue<NSRect>) {
++        NSColor.windowBackgroundColor.setFill()
++        NSRectFill(bounds)
++    }
++}
+--- /dev/null
++++ b/kinetica-appkit/test/AppKitCanvasTest.kt
+@@ -0,0 +1,58 @@
++@file:OptIn(kotlinx.cinterop.ExperimentalForeignApi::class)
++package io.heapy.kinetica.appkit
++
++import io.heapy.kinetica.*
++import io.heapy.kinetica.canvas.*
++import kotlinx.serialization.json.Json
++import platform.AppKit.*
++import platform.Foundation.*
++import kotlin.test.*
++
++class AppKitCanvasTest {
++    @Test fun resizeUsesLogicalCoordinatesAndDisposalStopsInput() {
++        NSApplication.sharedApplication()
++        val events = mutableListOf<CanvasInput>()
++        val view = AppKitCanvas { events += it }
++        view.update(CanvasModel(640.0, 480.0, CanvasColor(1.0,1.0,1.0), emptyList()))
++        view.setFrameSize(NSMakeSize(800.0, 600.0))
++        assertEquals(CanvasInput.Resize(800.0,600.0), events.last())
++        val count = events.size
++        view.setFrameSize(NSMakeSize(800.0,600.0))
++        assertEquals(count, events.size)
++        view.dispose()
++        view.setFrameSize(NSMakeSize(900.0,600.0))
++        assertEquals(count, events.size)
++    }
++
++    @Test fun rendererRetainsCanvasAndSupportsFocusAndUnmount() {
++        NSApplication.sharedApplication()
++        val window = NSWindow(NSMakeRect(0.0,0.0,640.0,480.0), NSWindowStyleMaskTitled, NSBackingStoreBuffered, false)
++        window.setReleasedWhenClosed(false)
++        var shown = true
++        var model = CanvasModel(640.0,480.0,CanvasColor(1.0,1.0,1.0),emptyList())
++        val app = renderAppKitApp(window.contentView!!) {
++            column { if(shown) canvas(model, onInput = {}, semantics = Semantics(testTag="canvas",focusable=true)) }
++        }
++        try {
++            val root = window.contentView!!.subviews.single() as NSView
++            val view = root.subviews.single() as AppKitCanvas
++            assertTrue(app.focus("canvas"))
++            assertEquals(view,window.firstResponder)
++            model = model.copy(shapes = listOf(CanvasShape.Circle(20.0,20.0,5.0,fill=CanvasColor(1.0,0.0,0.0))))
++            app.render()
++            assertSame(view,root.subviews.single())
++            shown = false; app.render()
++            assertFalse(app.focus("canvas"))
++            assertTrue(root.subviews.isEmpty())
++        } finally { app.dispose(); window.close() }
++    }
++
++    @Test fun canvasModelRoundTripsAndRejectsInvalidGeometry() {
++        val model = CanvasModel(400.0,300.0,CanvasColor(1.0,1.0,1.0),listOf(
++            CanvasShape.Polygon(listOf(CanvasPoint(0.0,0.0),CanvasPoint(10.0,0.0),CanvasPoint(0.0,10.0)),CanvasColor(1.0,0.0,0.0,.2))))
++        assertEquals(model,Json.decodeFromString<CanvasModel>(Json.encodeToString(model)))
++        assertFailsWith<IllegalArgumentException> { model.copy(width=0.0) }
++        assertFailsWith<IllegalArgumentException> { CanvasColor(Double.NaN,0.0,0.0) }
++        assertFailsWith<IllegalArgumentException> { CanvasShape.Polygon(emptyList(),CanvasColor(0.0,0.0,0.0)) }
++    }
++}
+--- /dev/null
++++ b/kinetica-render-core/src/Canvas.kt
+@@ -0,0 +1,53 @@
++package io.heapy.kinetica.canvas
++
++import io.heapy.kinetica.*
++import kotlinx.serialization.Serializable
++import kotlinx.serialization.json.Json
++
++@Serializable
++public data class CanvasColor(val red: Double, val green: Double, val blue: Double, val alpha: Double = 1.0) {
++    init { require(listOf(red, green, blue, alpha).all { it.isFinite() && it in 0.0..1.0 }) }
++}
++
++@Serializable
++public data class CanvasPoint(val x: Double, val y: Double)
++
++@Serializable
++public sealed interface CanvasShape {
++    @Serializable public data class Polygon(val points: List<CanvasPoint>, val fill: CanvasColor) : CanvasShape {
++        init { require(points.size >= 3 && points.all { it.x.isFinite() && it.y.isFinite() }) }
++    }
++    @Serializable public data class Line(val x1: Double, val y1: Double, val x2: Double, val y2: Double,
++        val color: CanvasColor, val width: Double = 1.0) : CanvasShape
++    @Serializable public data class Rectangle(val x: Double, val y: Double, val width: Double, val height: Double,
++        val fill: CanvasColor) : CanvasShape
++    @Serializable public data class Circle(val x: Double, val y: Double, val radius: Double,
++        val fill: CanvasColor? = null, val stroke: CanvasColor? = null, val strokeWidth: Double = 1.0) : CanvasShape
++}
++
++/** Coordinates use logical points with a top-left origin. This model contains no platform types. */
++@Serializable
++public data class CanvasModel(val width: Double, val height: Double, val background: CanvasColor,
++    val shapes: List<CanvasShape>) {
++    init { require(width.isFinite() && height.isFinite() && width > 0 && height > 0) }
++}
++
++public sealed interface CanvasInput {
++    public data class Resize(val width: Double, val height: Double) : CanvasInput
++    public data class Pointer(val phase: PointerPhase, val x: Double, val y: Double) : CanvasInput
++    public data class Scroll(val x: Double, val y: Double, val deltaY: Double) : CanvasInput
++    public data class Zoom(val x: Double, val y: Double, val factor: Double) : CanvasInput
++    public data class Key(val key: String, val shift: Boolean = false) : CanvasInput
++}
++public enum class PointerPhase { DOWN, MOVE, UP }
++public const val CANVAS_TAG: String = "kinetica:canvas"
++
++/** Retained leaf canvas. Backend availability is documented by each renderer. */
++@UiComponent
++public fun ComponentScope.canvas(model: CanvasModel, onInput: (CanvasInput) -> Unit,
++    semantics: Semantics = Semantics(label = "Canvas", focusable = true), key: Any? = null,
++    minWidth: Double = 240.0, minHeight: Double = 240.0) {
++    val event = hostEvent<CanvasInput>(onEvent = onInput)
++    host(CANVAS_TAG, props = mapOf("model" to Json.encodeToString(model), "event:onCanvas" to event,
++        "minWidth" to minWidth.toString(), "minHeight" to minHeight.toString()), semantics = semantics, key = key)
++}

@@ -1,0 +1,9 @@
+Dotki
+Copyright 2026 Ruslan Ibragimov
+
+The Gradle wrapper is distributed by Gradle under Apache-2.0.
+Its original copyright notices are preserved in the wrapper scripts.
+
+The Kinetica bootstrap downloads Heapy/kinetica under Apache-2.0.
+The downloaded source tree retains its original LICENSE. The desktop patch in
+this repository contains changes to Kinetica and is also provided under Apache-2.0.

@@ -1,0 +1,15 @@
+.gradle/
+.kotlin/
+**/build/
+.local/
+node_modules/
+.DS_Store
+playwright-report/
+test-results/
+__pycache__/
+
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-*

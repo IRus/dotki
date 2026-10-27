@@ -1,0 +1,12 @@
+{
+  "repository": "Heapy/kinetica",
+  "commit": "8511c3bfaba240d3e57a805c085351c6ffac1871",
+  "archive_sha256": "7542fc1fa9c95e9a983755a5bdda2134c14f6e1b26936e3d926d01f442fc882d",
+  "artifact_version": "0.4.0-dotki.1",
+  "patches": [
+    {
+      "path": "dependencies/patches/kinetica-desktop.patch",
+      "sha256": "0ceb7abde4a2314a2332aa697c8afa6ec5ab46231e6653465f3bf023da64d2b8"
+    }
+  ]
+}
