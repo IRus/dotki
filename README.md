@@ -105,6 +105,12 @@ docker build --build-arg DOTKI_VERSION=20261026-sqlite-edge-v1 -t dotki:20261026
 DOTKI_BASE_URL=https://your-dotki.example npx playwright test
 ```
 
+GitHub Actions собирает и проверяет Linux ARM64 образ `ghcr.io/irus/dotki`.
+Для каждого прошедшего проверку commit публикуются теги `sha-<полный SHA>` и `main`.
+В конфигурации развёртывания закрепляйте digest `@sha256:…` из успешной сборки.
+Перед публикацией CI проверяет JVM/native-тесты, HTTP, статические файлы и
+сохранность SQLite после перезапуска контейнера на отдельном временном томе.
+
 Для развёртывания используйте reverse proxy с HTTPS и поддержкой WebSocket.
 Healthcheck — `/health`; данные SQLite нужно хранить в постоянном томе `/data`.
 Контейнер работает под UID/GID 65532. Перезапуск сбрасывает активные комнаты,

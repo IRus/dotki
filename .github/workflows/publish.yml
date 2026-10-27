@@ -1,0 +1,96 @@
+name: Test and publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-native:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Fetch locked Kinetica sources
+        id: kinetica
+        run: |
+          directory=$(python3 scripts/fetch-kinetica.py)
+          printf 'directory=%s\n' "${directory#"$GITHUB_WORKSPACE/"}" >> "$GITHUB_OUTPUT"
+      - uses: Heapy/setup-ktc@e0a603c477110083db0b44f302deb188d4991ea0 # v1.1.0
+        with:
+          version: auto
+          working-directory: ${{ steps.kinetica.outputs.directory }}
+      - name: Build locked Kinetica dependencies
+        run: ./scripts/build-kinetica.sh
+      - name: Test rules, rooms, desktop geometry and native SQLite
+        run: ./gradlew --no-daemon :shared:jvmTest :server:jvmTest :desktop:jvmTest :shared:nativeTest :server:nativeTest
+      - name: Build web client and Linux ARM64 server
+        run: |
+          ./scripts/package-linux.sh linuxArm64
+          tar -czf build/dotki-linux-arm64.tar.gz -C build/docker-context-linuxArm64 .
+      - name: Upload container build context
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-arm64-context
+          path: build/dotki-linux-arm64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-arm64:
+    needs: build-native
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/irus/dotki
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-arm64-context
+          path: build
+      - name: Build container
+        run: |
+          mkdir -p build/context
+          tar -xzf build/dotki-linux-arm64.tar.gz -C build/context
+          docker build --build-arg "DOTKI_VERSION=$GITHUB_SHA" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$IMAGE:sha-$GITHUB_SHA" build/context
+      - name: Check server, web assets and SQLite persistence
+        run: ./scripts/smoke-test.sh "$IMAGE:sha-$GITHUB_SHA"
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish tested image
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "$IMAGE:sha-$GITHUB_SHA"
+          docker tag "$IMAGE:sha-$GITHUB_SHA" "$IMAGE:main"
+          docker push "$IMAGE:main"
+          digest=$(docker image inspect "$IMAGE:sha-$GITHUB_SHA" --format '{{index .RepoDigests 0}}')
+          printf 'Published %s\n' "$digest" >> "$GITHUB_STEP_SUMMARY"

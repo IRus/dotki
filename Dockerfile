@@ -1,5 +1,7 @@
 # Build context is produced by scripts/package-linux.sh; no sources or credentials are copied.
 FROM debian:bookworm-slim
+LABEL org.opencontainers.image.source="https://github.com/IRus/dotki" \
+      org.opencontainers.image.licenses="Apache-2.0"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libsqlite3-0 sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
